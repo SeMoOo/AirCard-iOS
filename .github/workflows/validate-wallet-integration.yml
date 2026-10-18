@@ -18,7 +18,7 @@ permissions:
 
 concurrency:
   group: wallet-integration-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   rebuild-build-and-package:
@@ -139,7 +139,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Both paths are intentionally ignored for local builds, but the validated CI outputs must be versioned.\n          git add -f -A -- AirliftFFI.xcframework AirCard-iOS.xcodeproj/project.pbxproj
+          # Both paths are intentionally ignored for local builds, but the validated CI outputs must be versioned.
+          git add -f -A -- AirliftFFI.xcframework AirCard-iOS.xcodeproj/project.pbxproj
           if git diff --cached --quiet; then
             echo "Native binary and Xcode project already current"
             exit 0

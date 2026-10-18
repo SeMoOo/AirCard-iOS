@@ -5,7 +5,7 @@
 //!   al_pairing_run_host    — RPPairing host (blocks until paired)
 //!   al_pairing_result_free — free the ALPairResult heap strings
 //!   al_exploit_run         — run the AirTraffic exploit over the loopback tunnel
-//!   al_exploit_export_file — destructively export a device file to a local path
+//!   al_exploit_export_file — export and recover Wallet artwork
 //!   al_string_free         — free any char* returned by this library
 
 use std::ffi::{c_char, c_void};
@@ -425,3 +425,58 @@ pub unsafe extern "C" fn al_device_respring(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Target Host Configuration
+// ---------------------------------------------------------------------------
+
+/// Set the primary target host/IP (e.g. "10.7.0.1") to dial first for RSD and tunnel operations.
+/// Passing NULL or empty string resets to None.
+/// Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn al_set_target_host(host: *const c_char) -> i32 {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let host_str = if host.is_null() {
+            None
+        } else {
+            let s = ffi_util::opt_str(host, "").trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        };
+        exploit::set_target_host(host_str);
+        0
+    }));
+    res.unwrap_or(1)
+}
+
+/// Set additional candidate target hosts (e.g. from local interface discovery).
+/// `hosts` is an array of C-strings of length `count`.
+/// Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn al_set_target_hosts(hosts: *const *const c_char, count: usize) -> i32 {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut list = Vec::new();
+        if !hosts.is_null() {
+            for i in 0..count {
+                let p = *hosts.add(i);
+                if !p.is_null() {
+                    let s = ffi_util::opt_str(p, "").trim().to_string();
+                    if !s.is_empty() && !list.contains(&s) {
+                        list.push(s);
+                    }
+                }
+            }
+        }
+        exploit::set_target_hosts(list);
+        0
+    }));
+    res.unwrap_or(1)
+}
+
+/// Clear custom target host settings, reverting to default tunnel IP fallbacks.
+#[no_mangle]
+pub extern "C" fn al_clear_target_hosts() {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        exploit::clear_target_hosts();
+    }));
+}
+

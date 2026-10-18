@@ -1,0 +1,75 @@
+name: Validate AirCard Wallet Integration
+
+on:
+  push:
+    branches:
+      - final/wallet-original-artwork
+    paths:
+      - ".github/workflows/validate-wallet-integration.yml"
+      - "rust-core/**"
+      - "project.yml"
+      - "AirCard-iOS.xcodeproj/**"
+      - "ios-app/**"
+      - "ios-tests/**"
+      - "tests/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wallet-integration-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rebuild-and-validate:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Wallet integration branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Rust for iOS
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Rebuild combined native XCFramework
+        run: |
+          chmod +x build-ios.sh
+          DEVELOPER_DIR="$(xcode-select -p)" ./build-ios.sh
+
+      - name: Verify both native FFI feature sets
+        run: |
+          set -euo pipefail
+          HEADER=AirliftFFI.xcframework/ios-arm64/Headers/airlift.h
+          LIB=AirliftFFI.xcframework/ios-arm64/libairlift_ffi.a
+          grep -q 'al_exploit_export_file' "$HEADER"
+          grep -q 'al_set_target_hosts' "$HEADER"
+          nm -gU "$LIB" | grep -q '_al_exploit_export_file'
+          nm -gU "$LIB" | grep -q '_al_set_target_hosts'
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for iOS device without signing
+        run: |
+          xcodebuild -project AirCard-iOS.xcodeproj -scheme AirCard-iOS \
+            -configuration Debug -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+
+      - name: Commit generated project and framework
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add AirliftFFI.xcframework AirCard-iOS.xcodeproj/project.pbxproj
+          if git diff --cached --quiet; then
+            echo "Native binary and Xcode project already current"
+            exit 0
+          fi
+          git commit -m "build: refresh merged Wallet FFI and Xcode project"
+          git push origin HEAD:final/wallet-original-artwork

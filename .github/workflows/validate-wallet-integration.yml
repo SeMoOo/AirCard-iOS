@@ -1,4 +1,4 @@
-name: Validate AirCard Wallet Integration
+name: Build and Validate AirCard Wallet IPA
 
 on:
   push:
@@ -8,10 +8,10 @@ on:
       - ".github/workflows/validate-wallet-integration.yml"
       - "rust-core/**"
       - "project.yml"
-      - "AirCard-iOS.xcodeproj/**"
       - "ios-app/**"
       - "ios-tests/**"
       - "tests/**"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,49 +21,122 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  rebuild-and-validate:
+  rebuild-build-and-package:
     runs-on: macos-latest
+    timeout-minutes: 75
     steps:
-      - name: Checkout Wallet integration branch
+      - name: Checkout wallet integration branch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           persist-credentials: true
+          fetch-depth: 0
 
-      - name: Install Rust for iOS
+      - name: Identify macOS and Xcode tools
+        run: |
+          set -euo pipefail
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install Rust for iOS and matching LLVM tools
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
+          components: llvm-tools-preview
 
       - name: Install XcodeGen
-        run: brew install xcodegen
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
 
       - name: Rebuild combined native XCFramework
         run: |
+          set -euo pipefail
           chmod +x build-ios.sh
           DEVELOPER_DIR="$(xcode-select -p)" ./build-ios.sh
 
-      - name: Verify both native FFI feature sets
+      - name: Verify native exported symbols with matching Rust LLVM
         run: |
           set -euo pipefail
           HEADER=AirliftFFI.xcframework/ios-arm64/Headers/airlift.h
           LIB=AirliftFFI.xcframework/ios-arm64/libairlift_ffi.a
-          grep -q 'al_exploit_export_file' "$HEADER"
-          grep -q 'al_set_target_hosts' "$HEADER"
-          nm -gU "$LIB" | grep -q '_al_exploit_export_file'
-          nm -gU "$LIB" | grep -q '_al_set_target_hosts'
+          SIM_LIB=AirliftFFI.xcframework/ios-arm64-simulator/libairlift_ffi.a
+          for symbol in al_exploit_export_file al_set_target_hosts; do
+            grep -Fq "$symbol" "$HEADER"
+          done
+          LLVM_NM="$(find "$(rustc --print sysroot)/lib/rustlib" -type f -name llvm-nm -print -quit)"
+          test -n "$LLVM_NM" && test -x "$LLVM_NM"
+          for archive in "$LIB" "$SIM_LIB"; do
+            SYMBOL_FILE="$RUNNER_TEMP/$(basename "$(dirname "$archive")")-symbols.txt"
+            "$LLVM_NM" --defined-only --extern-only "$archive" > "$SYMBOL_FILE"
+            for symbol in _al_exploit_export_file _al_set_target_hosts; do
+              if ! grep -Fq "$symbol" "$SYMBOL_FILE"; then
+                echo "::error::Missing $symbol in $archive"
+                exit 1
+              fi
+            done
+          done
 
-      - name: Generate Xcode project
-        run: xcodegen generate
-
-      - name: Build for iOS device without signing
+      - name: Regenerate Xcode project and verify both test suites
         run: |
-          xcodebuild -project AirCard-iOS.xcodeproj -scheme AirCard-iOS \
-            -configuration Debug -destination 'generic/platform=iOS' \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+          set -euo pipefail
+          xcodegen generate
+          grep -Fq "WalletSafetyTests.swift" AirCard-iOS.xcodeproj/project.pbxproj
+          grep -Fq "WalletScanParserTests.swift" AirCard-iOS.xcodeproj/project.pbxproj
 
-      - name: Commit generated project and framework
+      - name: Compile Release iOS app without code signing
         run: |
+          set -euo pipefail
+          xcodebuild -quiet \
+            -project AirCard-iOS.xcodeproj \
+            -scheme AirCard-iOS \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/AirCardDerivedData" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+
+      - name: Package and verify unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/AirCardDerivedData/Build/Products/Release-iphoneos/AirCard-iOS.app"
+          test -d "$APP"
+          test -s "$APP/AirCard-iOS"
+          mkdir -p dist/Payload
+          cp -R "$APP" dist/Payload/AirCard-iOS.app
+          rm -rf dist/Payload/AirCard-iOS.app/_CodeSignature
+          rm -f dist/Payload/AirCard-iOS.app/embedded.mobileprovision
+          (
+            cd dist
+            zip -qry AirCard-iOS-v1.3.2-unsigned.ipa Payload
+          )
+          test -s dist/AirCard-iOS-v1.3.2-unsigned.ipa
+          unzip -tq dist/AirCard-iOS-v1.3.2-unsigned.ipa
+          unzip -Z1 dist/AirCard-iOS-v1.3.2-unsigned.ipa > "$RUNNER_TEMP/ipa-contents.txt"
+          grep -Fq "Payload/AirCard-iOS.app/AirCard-iOS" "$RUNNER_TEMP/ipa-contents.txt"
+          du -h dist/AirCard-iOS-v1.3.2-unsigned.ipa
+          shasum -a 256 dist/AirCard-iOS-v1.3.2-unsigned.ipa | tee dist/SHA256SUMS.txt
+          echo "### IPA build passed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Unsigned iOS 18+ IPA; sign with an appropriate provisioning profile before installing." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload compiled unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirCard-iOS-v1.3.2-unsigned-IPA
+          path: |
+            dist/AirCard-iOS-v1.3.2-unsigned.ipa
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Commit successfully built native binaries and Xcode project
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add AirliftFFI.xcframework AirCard-iOS.xcodeproj/project.pbxproj
@@ -71,5 +144,5 @@ jobs:
             echo "Native binary and Xcode project already current"
             exit 0
           fi
-          git commit -m "build: refresh merged Wallet FFI and Xcode project"
-          git push origin HEAD:final/wallet-original-artwork
+          git commit -m "build: sync validated Wallet v1.3.2 FFI and Xcode project"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
